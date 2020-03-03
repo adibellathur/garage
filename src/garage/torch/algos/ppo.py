@@ -40,6 +40,8 @@ class PPO(VPG):
             dense entropy to the reward for each time step. 'regularized' adds
             the mean entropy to the surrogate objective. See
             https://arxiv.org/abs/1805.00909 for more details.
+        minibatch_size (int): Batch size for optimization.
+        max_optimization_epochs (int): Maximum number of epochs for update.
 
     """
 
@@ -59,7 +61,9 @@ class PPO(VPG):
                  policy_ent_coeff=0.0,
                  use_softplus_entropy=False,
                  stop_entropy_gradient=False,
-                 entropy_method='no_entropy'):
+                 entropy_method='no_entropy',
+                 minibatch_size=None,
+                 max_optimization_epochs=1):
 
         super().__init__(env_spec=env_spec,
                          policy=policy,
@@ -75,11 +79,13 @@ class PPO(VPG):
                          policy_ent_coeff=policy_ent_coeff,
                          use_softplus_entropy=use_softplus_entropy,
                          stop_entropy_gradient=stop_entropy_gradient,
-                         entropy_method=entropy_method)
+                         entropy_method=entropy_method,
+                         minibatch_size=minibatch_size,
+                         max_optimization_epochs=max_optimization_epochs)
 
         self._lr_clip_range = lr_clip_range
 
-    def _compute_objective(self, advantages, valids, obs, actions, rewards):
+    def _compute_objective(self, advantages, obs, actions, rewards):
         """Compute objective using surrogate value and clipped surrogate value.
 
         Args:

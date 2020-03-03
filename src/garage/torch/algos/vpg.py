@@ -2,11 +2,9 @@
 import collections
 import copy
 
-from dowel import tabular
-import numpy as np
 import torch
 import torch.nn.functional as F
-
+from dowel import tabular, logger
 from garage import log_performance, TrajectoryBatch
 from garage.misc import tensor_utils
 from garage.np.algos import BatchPolopt
@@ -51,6 +49,8 @@ class VPG(BatchPolopt):
             dense entropy to the reward for each time step. 'regularized' adds
             the mean entropy to the surrogate objective. See
             https://arxiv.org/abs/1805.00909 for more details.
+        minibatch_size (int): Batch size for optimization.
+        max_optimization_epochs (int): Maximum number of epochs for update.
 
     """
 
@@ -71,6 +71,8 @@ class VPG(BatchPolopt):
             use_softplus_entropy=False,
             stop_entropy_gradient=False,
             entropy_method='no_entropy',
+            minibatch_size=None,
+            max_optimization_epochs=1,
     ):
         self._gae_lambda = gae_lambda
         self._center_adv = center_adv
@@ -79,6 +81,8 @@ class VPG(BatchPolopt):
         self._use_softplus_entropy = use_softplus_entropy
         self._stop_entropy_gradient = stop_entropy_gradient
         self._entropy_method = entropy_method
+        self._minibatch_size = minibatch_size
+        self._max_optimization_epochs = max_optimization_epochs
         self._eps = 1e-8
 
         self._maximum_entropy = (entropy_method == 'max')
@@ -135,40 +139,78 @@ class VPG(BatchPolopt):
         obs, actions, rewards, valids, baselines = self.process_samples(
             itr, paths)
 
-        loss = self._compute_loss(itr, obs, actions, rewards, valids,
-                                  baselines)
+        if self._maximum_entropy:
+            policy_entropies = self._compute_policy_entropy(obs)
+            rewards += self._policy_ent_coeff * policy_entropies
+
+        advantages = self._compute_advantage(itr, obs, actions, rewards, valids, baselines)
+
+        obs_flat = torch.cat(filter_valids(obs, valids))
+        actions_flat = torch.cat(filter_valids(actions, valids))
+        rewards_flat = torch.cat(filter_valids(rewards, valids))
+        baselines_flat = torch.cat(filter_valids(baselines, valids))
+        advantages_flat = torch.cat(filter_valids(advantages, valids))
+
+        with torch.no_grad():
+            loss_before = self._compute_loss(itr, obs_flat, actions_flat, rewards_flat, baselines_flat, advantages_flat)
+            kl_before = self._compute_kl_constraint(obs_flat)
+
+        step_size = self._minibatch_size if self._minibatch_size else len(rewards_flat)
+        for epoch in range(self._max_optimization_epochs):
+            shuffled_ids = torch.randperm(len(rewards_flat))
+            for start in range(0, len(rewards_flat), step_size):
+                ids = shuffled_ids[start:start+step_size].numpy()
+                loss = self._train(itr, obs_flat[ids], actions_flat[ids],
+                                   rewards_flat[ids], baselines_flat[ids],
+                                   advantages_flat[ids])
+            logger.log('Epoch: {} | Loss: {}'.format(epoch, loss))
+
+        self.baseline.fit(paths)
 
         self._old_policy.load_state_dict(self.policy.state_dict())
+
+        with torch.no_grad():
+            loss_after = self._compute_loss(itr, obs_flat, actions_flat, rewards_flat, baselines_flat, advantages_flat)
+            kl_after = self._compute_kl_constraint(obs_flat)
+            policy_entropy = self._compute_policy_entropy(obs_flat)
+
+        with tabular.prefix(self.policy.name):
+            tabular.record('LossBefore', loss_before.item())
+            tabular.record('LossAfter', loss_after.item())
+            tabular.record('dLoss', loss_before.item() - loss_after.item())
+            tabular.record('KLBefore', kl_before.item())
+            tabular.record('KL', kl_after.item())
+            tabular.record('Entropy', policy_entropy.mean().item())
+
+        return log_performance(itr, TrajectoryBatch.from_trajectory_list(
+            self.env_spec, paths), discount=self.discount)
+
+    def _train(self, itr, obs, actions, rewards, baselines, advantages):
+        """Train the algorithm with minibatch.
+
+        Args:
+            itr (int): Iteration number.
+            obs (torch.Tensor): Observation from the environment.
+            actions (torch.Tensor): Predicted action.
+            rewards (torch.Tensor): Feedback from the environment.
+            valids (list[int]): Array of length of the valid values.
+            baselines (torch.Tensor): Value function estimation at each step.
+
+        Returns:
+            torch.Tensor: Calculated mean value of loss
+
+        """
+        loss = self._compute_loss(itr, obs, actions, rewards,
+                                  baselines, advantages)
 
         self._optimizer.zero_grad()
         loss.backward()
 
-        kl_before = self._compute_kl_constraint(obs).detach()
-        self._optimize(itr, obs, actions, rewards, valids, baselines)
+        self._optimize(itr, obs, actions, rewards, baselines)
 
-        with torch.no_grad():
-            loss_after = self._compute_loss(itr, obs, actions, rewards, valids,
-                                            baselines)
-            kl = self._compute_kl_constraint(obs)
-            policy_entropy = self._compute_policy_entropy(obs)
+        return loss
 
-        average_returns = log_performance(itr,
-                                          TrajectoryBatch.from_trajectory_list(
-                                              self.env_spec, paths),
-                                          discount=self.discount)
-
-        with tabular.prefix(self.policy.name):
-            tabular.record('LossBefore', loss.item())
-            tabular.record('LossAfter', loss_after.item())
-            tabular.record('dLoss', loss.item() - loss_after.item())
-            tabular.record('KLBefore', kl_before.item())
-            tabular.record('KL', kl.item())
-            tabular.record('Entropy', policy_entropy.mean().item())
-
-        self.baseline.fit(paths)
-        return np.mean(average_returns)
-
-    def _compute_loss(self, itr, obs, actions, rewards, valids, baselines):
+    def _compute_loss(self, itr, obs, actions, rewards, baselines, advantages):
         """Compute mean value of loss.
 
         Args:
@@ -183,37 +225,31 @@ class VPG(BatchPolopt):
             torch.Tensor: Calculated mean value of loss
 
         """
-        del itr
+        del itr, baselines
+        objective = self._compute_objective(advantages, obs, actions, rewards)
 
-        policy_entropies = self._compute_policy_entropy(obs)
+        return -objective.mean()
 
-        if self._maximum_entropy:
-            rewards += self._policy_ent_coeff * policy_entropies
+    def _compute_advantage(self, itr, obs, actions, rewards, valids, baselines):
+        del itr, obs, actions
 
         advantages = compute_advantages(self.discount, self._gae_lambda,
                                         self.max_path_length, baselines,
                                         rewards)
-
         if self._center_adv:
-            means, variances = list(
-                zip(*[(valid_adv.mean(), valid_adv.var())
-                      for valid_adv in filter_valids(advantages, valids)]))
-            advantages = F.batch_norm(advantages.t(),
-                                      torch.Tensor(means),
-                                      torch.Tensor(variances),
-                                      eps=self._eps).t()
+            valid_transposed_adv = [adv[valids > i] for i, adv
+                                    in enumerate(advantages.T)]
+            means = torch.Tensor([adv.mean() for adv in valid_transposed_adv])
+            means[torch.isnan(means)] = 0
+            varz = torch.Tensor([adv.var() for adv in valid_transposed_adv])
+            varz[torch.isnan(varz)] = 1
+
+            advantages = F.batch_norm(advantages, means, varz, eps=self._eps)
 
         if self._positive_adv:
             advantages -= advantages.min()
 
-        objective = self._compute_objective(advantages, valids, obs, actions,
-                                            rewards)
-
-        if self._entropy_regularzied:
-            objective += self._policy_ent_coeff * policy_entropies
-
-        valid_objectives = filter_valids(objective, valids)
-        return -torch.cat(valid_objectives).mean()
+        return advantages
 
     def _compute_kl_constraint(self, obs):
         """Compute KL divergence.
@@ -228,11 +264,10 @@ class VPG(BatchPolopt):
             torch.Tensor: Calculated mean KL divergence.
 
         """
-        flat_obs = flatten_batch(obs)
         with torch.no_grad():
-            old_dist = self._old_policy.forward(flat_obs)
+            old_dist = self._old_policy.forward(obs)
 
-        new_dist = self.policy.forward(flat_obs)
+        new_dist = self.policy.forward(obs)
 
         kl_constraint = torch.distributions.kl.kl_divergence(
             old_dist, new_dist)
@@ -261,7 +296,7 @@ class VPG(BatchPolopt):
 
         return policy_entropy
 
-    def _compute_objective(self, advantages, valids, obs, actions, rewards):
+    def _compute_objective(self, advantages, obs, actions, rewards):
         """Compute objective value.
 
         Args:
@@ -275,9 +310,16 @@ class VPG(BatchPolopt):
             torch.Tensor: Calculated objective values
 
         """
-        # pylint: disable=unused-argument
+        del rewards
         log_likelihoods = self.policy.log_likelihood(obs, actions)
-        return log_likelihoods * advantages
+
+        objectives = log_likelihoods * advantages
+
+        if self._entropy_regularzied:
+            policy_entropies = self._compute_policy_entropy(obs)
+            objectives += self._policy_ent_coeff * policy_entropies
+
+        return objectives
 
     def _get_baselines(self, path):
         """Get baseline values of the path.
@@ -294,8 +336,8 @@ class VPG(BatchPolopt):
             return torch.Tensor(self.baseline.predict_n(path))
         return torch.Tensor(self.baseline.predict(path))
 
-    def _optimize(self, itr, obs, actions, rewards, valids, baselines):
-        del itr, valids, obs, actions, rewards, baselines
+    def _optimize(self, itr, obs, actions, rewards, baselines):
+        del itr, obs, actions, rewards, baselines
         self._optimizer.step()
 
     def process_samples(self, itr, paths):
@@ -320,7 +362,7 @@ class VPG(BatchPolopt):
                 path['returns'] = tensor_utils.discount_cumsum(
                     path['rewards'], self.discount)
 
-        valids = [len(path['actions']) for path in paths]
+        valids = torch.Tensor([len(path['actions']) for path in paths]).int()
         obs = torch.stack([
             pad_to_last(path['observations'],
                         total_length=self.max_path_length,
